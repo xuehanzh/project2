@@ -1,2 +1,3 @@
-# project2
-Flight Pattern Differences Analysis before/during/after Columbus Day Using R and ggplot2
+# INF 554 Assignment 4
+
+Update this README as needed.

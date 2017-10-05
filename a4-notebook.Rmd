@@ -1,0 +1,377 @@
+---
+title: "Analysis and Comparison Between Flights in March 23rd and November 30th Around SMO"
+output:
+  html_notebook: default
+  html_document: default
+  word_document: default
+---
+
+# Preparation
+
+Before you preview this notebook please install and library the following packages (select and run):
+
+```{r, eval= FALSE,message=FALSE, error=FALSE,comment=FALSE,warning=FALSE}
+install.packages("lubridate")
+install.packages("plotly")
+install.packages("dplyr")
+install.packages("ggplot2")
+install.packages("ggmap")
+install.package('sp')
+install.package('geosphere')
+```
+
+```{r, message=FALSE, error=FALSE, comment=FALSE,warning=FALSE}
+library(lubridate)
+library(ggplot2)
+library(ggmap)
+library(plotly)
+library(dplyr)
+library(sp)
+library(geosphere)
+```
+
+
+#Data Preprocessing
+
+There are 4 .log.gz files(can be downloaded from my repository) which contain the raw data of flight transponder of March 23rd and November 30th. I used code below to clean the data and save them as csv files for future visualization. 
+
+```{r,message=FALSE, error=FALSE, warning=FALSE}
+######################################
+# These I've already installed.
+# install.packages('dplyr')
+# install.packages('lubridate')
+# install.packages('ggplot2')
+# install.packages('ggmap')
+# install.packages('plotly')
+# install.packages('sp')
+# install.packages('geosphere')
+######################################
+
+#will use dplyr and lubridate
+#library(dplyr)
+#library(lubridate)
+#library(ggplot2)
+#library(ggmap)
+#library(plotly)
+#library(dplyr)
+#library(sp)
+#library(geosphere)
+######################################
+# Loading data.
+######################################
+SMO <- data.frame(label = "SMO", lon=-118.456667, lat=34.010167)
+smo <- c(SMO$lon, SMO$lat)
+# load RTL gzip file
+# df <- load_rtl("./RTL15/RTL15111500.log.gz")
+load_rtl <- function(filename) { 
+  df <- read.csv(gzfile(filename), header=F)
+  #V1 date: from 2015/03/01 to 2015/03/02
+  #V2 is a time formatted as HH:MM:SS.000; from 16:00:00.000 to 15:59:58.000
+  #V3 is 1111111
+  #V4 is the transponder code (normally unique ICAO 24-bit address or (informally) Mode-S "hex code")
+  #V5 is the flight number
+  #V6 is "Unknown"
+  #V7 is "0"
+  #V8 == V9 altitude
+  #V10 latitude
+  #V11 longitude
+  #V12-17 do not seem to be useful
+  
+  ######################################
+  # Tidying-up the data.
+  ######################################
+  
+  df <- df[,1:11]  #only keep first 11
+  
+  #set timestamp from V1(date) and V2(time)
+  df <- df %>% mutate(timestamp = ymd_hms(paste(df$V1, df$V2), tz="America/Los_Angeles"))
+  #remove not useful
+  df$V1 <- NULL
+  df$V2 <- NULL
+  df$V3 <- NULL
+  df$V6 <- NULL
+  df$V7 <- NULL
+  df$V9 <- NULL
+  
+  #rename columns
+  names(df) <- c("code", "flight", "alt", "lat", "lon", "timestamp")
+  
+  #drop records with invalid lat, lon and alt readings
+  df <- df[df$lat != 0,]
+  df <- df[df$alt > 0,]
+  
+  #fix flight names: strip white spaces from flight
+  df$flight <- gsub("^[[:space:]]+|[[:space:]]+$", "", df$flight)
+  df$flight[df$flight == "?"] <- ''
+  df$flight[df$flight == "00000000"] <- ''
+  df$flight[df$flight == "????????"] <- ''
+  df$flight[df$flight == "@@@@@@@@"] <- ''
+  
+  #fix empty flights names with unique's flight associated using the code
+  uniques <- unique(df[c("flight", "code")])
+  uniques <- uniques[uniques$flight != '',]
+  na.flight <- which(df$flight == '')
+  na.code <- df$code[na.flight]
+  df$flight[df$flight == ''] <- uniques$flight[match(na.code, uniques$code, NA)]
+  
+  #order the dataframe
+  df <- df[order(df$code, df$flight, df$timestamp, decreasing = FALSE),]
+  
+  #remove code starting with a60 and no flight name as these are from private planes.
+  df <- df %>% filter(!(grepl('[acd]60', code) & is.na(flight)))
+  df <- df %>% filter(!(grepl('[c]50', code) & is.na(flight)))
+  df <- df %>% filter(!(grepl('[d]20', code) & is.na(flight)))
+  
+  #remove duplicate rows
+  df <- unique(df)  #or with dplyr: df <- df %>% distinct()
+  
+  #using dplyr keep only first time for same flight position (alt, lon, lat)
+  df <- df %>%
+    group_by(code, flight, lat, lon, alt) %>% 
+    summarize(timestamp = first(timestamp))
+  
+  #using dplyr keep only first alt for same flight location (lon, lat) and time
+  df <- df %>%
+    group_by(code, flight, lat, lon, timestamp) %>% 
+    summarize(alt = first(alt))  #could use mean(alt)
+  
+  #using dplyr keep first alt, lat, lon for the same flight at the same time
+  df <- df %>%
+    group_by(timestamp, flight, code) %>%
+    summarise(alt = first(alt), lat = first(lat), lon = first(lon))
+  
+  #add track variable to identify separate flights in the same day (delta(timestamp) > )
+  df <- df[order(df$code, df$flight, df$timestamp, decreasing = FALSE),]  #ensure is ordered by flight & timestamp
+  df <- df %>% group_by(code, flight) %>%
+    mutate(track = as.integer(difftime(timestamp, lag(timestamp)))) %>%
+    mutate(track = ifelse(is.na(track), 0, track)) %>%
+    mutate(track = ifelse(track > 3600, 1, 0)) %>%  #3600s = 1h
+    mutate(track = cumsum(track)) %>%
+    mutate(id = paste0(code, flight, track))
+  
+  #count number of records per track
+  df2 <- df %>% count(code, flight, track, id) %>% filter(n < 6)
+  #df3 <- df %>% group_by(code, flight, track) %>% summarize(n = n())  #similar way of counting!
+  
+  #remove too few records per track
+  df <- df %>% filter(!(id %in% df2$id))
+  
+  df <- df %>% arrange(flight, code, track, desc(timestamp))  #arrange rows with dplyr
+  df <- df %>% select(timestamp, flight, code, track, id, lon, lat, alt)  #re-order column names
+ 
+   # keep only if alt > 11000 and > 3000 feet
+  df <- df %>% filter(alt < 11000 & alt > 3000)  #observations that go within 2km of SMO.
+  
+  #compute closest distance to SMOVOR (in meters)
+  df$dist <- distHaversine(smo, cbind(df$lon, df$lat))  #geodesic distance (great-circle distance) to SMO
+  # filter flights that get within 2Km from SMOVOR
+  df_min <- df %>% filter(dist < 2000.0)  #closest observations to SMO
+  df <- df %>% filter(id %in% df_min$id)  #observations that go within 2km of SMO.
+  
+  return (df)
+}
+
+# day 1: 150323
+###############
+df11 <- load_rtl("RTL15/RTL15032300.log.gz");
+df12 <- load_rtl("RTL15/RTL15032400.log.gz");
+df1 <- dplyr::bind_rows(df11, df12)
+#filter night: (12AM-6:30AM) day: (6:30AM-12AM)
+nighttime <- interval(ymd_hms("2015-03-23 00:00:00", tz="America/Los_Angeles"), ymd_hms("2015-03-23 06:30:00", tz="America/Los_Angeles"))
+daytime <- interval(ymd_hms("2015-03-23 06:30:00", tz="America/Los_Angeles"), ymd_hms("2015-03-24 00:00:00", tz="America/Los_Angeles"))
+df1d <- df1 %>% filter(timestamp %within% daytime)
+df1n <- df1 %>% filter(timestamp %within% nighttime)
+#verify time intervals with summary(df1d) and summary(df1n)
+# save to csv for analysis
+write.table(df1d, "RTL150323_day.csv", sep = ",")
+write.table(df1n, "RTL150323_night.csv", sep = ",")
+# day 2: 151130
+###############
+df11 <- load_rtl("RTL15/RTL15113000.log.gz");
+df12 <- load_rtl("RTL15/RTL15120100.log.gz");
+df1 <- dplyr::bind_rows(df11, df12)
+#filter
+#night: (12AM-6:30AM)
+#day: (6:30AM-12AM)
+nighttime <- interval(ymd_hms("2015-11-30 00:00:00", tz="America/Los_Angeles"), ymd_hms("2015-11-30 06:30:00", tz="America/Los_Angeles"))
+daytime <- interval(ymd_hms("2015-11-30 06:30:00", tz="America/Los_Angeles"), ymd_hms("2015-12-01 00:00:00", tz="America/Los_Angeles"))
+df1d <- df1 %>% filter(timestamp %within% daytime)
+df1n <- df1 %>% filter(timestamp %within% nighttime)
+#verify time intervals with summary(df1d) and summary(df1n)
+# save to csv for analysis
+write.table(df1d, "RTL151130_day.csv", sep = ",")
+write.table(df1n, "RTL151130_night.csv", sep = ",")
+```
+
+You can download these 4 csv files from my repository or just run the chunk above to generate them.
+
+# Data Visualization and Analysis
+So ggplot2 is the main tool I used to generate different plots and charts. 
+
+##Overall Trends
+First, I made a 4 scatterplots, each one corresponds with daytime (westerly operation) from 6:30AM-12AM and nighttime (over-ocean operation) from 12AM-6:30AM of March 23rd and November 30th.
+
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+#.R file name: Westerly Operations 03/23/2015
+df3d <- read.csv("RTL150323_day.csv")
+df3d$dt <- as.POSIXct(df3d$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x = lon, y = lat), color="red", size=10, alpha=.5) +
+  geom_point(data = df3d, 
+             size=1, alpha=.5,
+             aes(x = lon, y = lat, color = id, text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt))) +
+  theme(legend.position = "none") +
+  ggtitle("Westerly Operations 03/23/2015")
+ggplotly()
+
+#.R file name: Over-Ocean Operations 03/23/2015
+df3n <- read.csv("RTL150323_night.csv")
+df3n$dt <- as.POSIXct(df3n$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x = lon, y = lat), color="red", size=10, alpha=.5) +
+  geom_point(data = df3n, 
+             size=1, alpha=.5,
+             aes(x = lon, y = lat, color = id, text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt))) +
+  theme(legend.position = "none") +
+  ggtitle("Over-Ocean Operations 03/23/2015")
+ggplotly()
+
+#.R file name: Westerly Operations 11/30/2015
+df11d <- read.csv("RTL151130_day.csv")
+df11d$dt <- as.POSIXct(df11d$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x = lon, y = lat), color="red", size=10, alpha=.5) +
+  geom_point(data = df11d, 
+             size=1, alpha=.5,
+             aes(x = lon, y = lat, color = id, text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt))) +
+  theme(legend.position = "none") +
+  ggtitle("Westerly Operations 11/30/2015")
+ggplotly()
+
+#.R file name: Over-Ocean Operations 11/30/2015
+df11n <- read.csv("RTL151130_night.csv")
+df11n$dt <- as.POSIXct(df11n$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x = lon, y = lat), color="red", size=10, alpha=.5) +
+  geom_point(data = df11n, 
+             size=1, alpha=.5,
+             aes(x = lon, y = lat, color = id, text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt))) +
+  theme(legend.position = "none") +
+  ggtitle("Over-Ocean Operations 11/30/2015")
+ggplotly()
+```
+
+From the 4 scatterplots we can see: First, in the same day, there are far more flights in daytime than in nighttime. Second, there are far more flights on March 23rd than on November 30th, this proves that there is more flight traffic around Los Angeles area after Columbus Day. Third, there are some new flights which go through the south coast area such as Torrance and Long Beach on November 30th (after Columbus Day).
+
+##Altitude Difference
+The previous scatterplots used fight ID to color diffenrent fights. Next, I used altitude to color them instead of flight ID, which will show the altitude difference of flights around SMO area.
+
+```{r,message=FALSE, error=FALSE, warning=FALSE}
+#.R file name: day 03/23/2015 path.R
+df3d$dt <- as.POSIXct(df3d$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x=lon, y=lat), color="green", size=5, alpha=.5) +
+  geom_path(data=df3d, aes(x = lon, y = lat, color=alt,text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt)), alpha=.5) +
+  scale_colour_gradient(limits=c(3000, 11000), low="red", high="blue") +
+  ggtitle("Westerly Operations 03/23/2015")
+ggplotly()
+
+#.R file name: night 03/23/2015 path.R
+df3n$dt <- as.POSIXct(df3n$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x=lon, y=lat), color="green", size=5, alpha=.5) +
+  geom_path(data=df3n, aes(x = lon, y = lat, color=alt,text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt)), alpha=.5) +
+  scale_colour_gradient(limits=c(3000, 11000), low="red", high="blue") +
+  ggtitle("Over-Ocean Operations 03/23/2015")
+ggplotly()
+
+#.R file name: day 11/30/2015 path.R
+df11d$dt <- as.POSIXct(df11d$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x=lon, y=lat), color="green", size=5, alpha=.5) +
+  geom_path(data=df11d, aes(x = lon, y = lat, color=alt,text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt)), alpha=.5) +
+  scale_colour_gradient(limits=c(3000, 11000), low="red", high="blue") +
+  ggtitle("Westerly Operations 11/30/2015")
+ggplotly()
+
+#.R file name: day 11/30/2015 path.R
+df11n$dt <- as.POSIXct(df11n$timestamp, tz="America/Los_Angeles")
+map.google <- get_map(smo, zoom = 10)  # get map around SMO
+ggmap(map.google) +
+  geom_point(data = SMO, aes(x=lon, y=lat), color="green", size=5, alpha=.5) +
+  geom_path(data=df11n, aes(x = lon, y = lat, color=alt,text = paste("Airline:", flight, "<br>code:", code, "<br>timestamp:", timestamp, "<br>alt:", alt)), alpha=.5) +
+  scale_colour_gradient(limits=c(3000, 11000), low="red", high="blue") +
+  ggtitle("Over-Ocean Operations 11/30/2015")
+ggplotly()
+```
+
+Bsides, I also made 4 scatterplots which show the altitude difference of fight in different time of one day around SMO area.
+
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+#.R file name: Flight Altitude.R
+#March 23rd daytime
+alt3d=data.frame(
+  DateTime=df3d$timestamp,
+  hour=format(as.POSIXct(df3d$timestamp, format="%Y-%m-%d %H:%M"), format="%H"),
+  altitude = df3d$alt
+)
+ggplot(alt3d, aes(hour, altitude)) + geom_point() + ggtitle('Flight Altitude of Mar.23 Daytime')
+
+#March 23rd nighttime
+alt3n=data.frame(
+  DateTime=df3n$timestamp,
+  hour=format(as.POSIXct(df3n$timestamp, format="%Y-%m-%d %H:%M"), format="%H"),
+  altitude = df3n$alt
+)
+ggplot(alt3n, aes(hour, altitude)) + geom_point() + ggtitle('Flight Altitude of Mar.23 Nighttime')
+
+#November 30th daytime
+alt11d=data.frame(
+  DateTime=df11d$timestamp,
+  hour=format(as.POSIXct(df11d$timestamp, format="%Y-%m-%d %H:%M"), format="%H"),
+  altitude = df11d$alt
+)
+ggplot(alt11d, aes(hour, altitude)) + geom_point() + ggtitle('Flight Altitude of Nov.11 Daytime')
+
+#November 30th nighttime
+alt11n=data.frame(
+  DateTime=df11n$timestamp,
+  hour=format(as.POSIXct(df11n$timestamp, format="%Y-%m-%d %H:%M"), format="%H"),
+  altitude = df11n$alt
+)
+ggplot(alt11n, aes(hour, altitude)) + geom_point() + ggtitle('Flight Altitude of Nov.11 Nighttime')
+
+```
+
+From the plots above we can see: First, in general, the altitude of flights during daytime are lower than nighttime, which means there are more flights tend to land during daytime around Los Angeles Area, most flights at night are just flying rather than landing, this might indicate it would be less noisy duing nighttime around Los Angeles area. This applies to both the two days we are analyzing. Second, There are more flights landing around Los Angeles Area from south during the daytime of November 30th (after Columbus day).
+
+##Unique Flights 
+
+Last, I made a bar chart to better present the difference of the number of unique flights between March 23rd and Novermber 30th.
+
+```{r, message=FALSE, error=FALSE, warning=FALSE}
+#.R file name: Number of Unique Flights.R
+a = length(unique(df3d$id))
+b = length(unique(df3n$id))
+c = length(unique(df11d$id))
+d = length(unique(df11n$id))
+
+fc = data.frame(time = c('Mar.23 daytime','Mar.23 nighttime','Nov.30 daytime','Nov.30 nighttime'), count =  c(a,b,c,d))
+ggplot(fc,aes(time,count)) + geom_bar(stat = 'identity') + ggtitle('Number of Unique Flights')
+```
+
+From this bar chart we can see: First, for both the two days we are analyzing, there are far more unique flights operating in daytime than in nighttime around Los Angeles area. Second, there are more flights on both daytime and nighttime on November 30th than on March 23rd around Los Angeles area, which means that there are more flights added after the Columbus Day.
+
+
+
+
+
+
+         
